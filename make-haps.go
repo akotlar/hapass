@@ -413,14 +413,10 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 		// Is sample-wise
 		sampleGenos := make([][]byte, nSamples, nSamples)
 
-		// We do this because in the backward pass we may need to see the site
+		// Just build a vector of sites for
 		for i := range sampleGenos {
 			sampleGenos[i] = make([]byte, nSites, nSites)
 		}
-
-		// log.Println(len(sampleGenos))
-		// start :=
-		// stop := 0
 
 		// We begin constructing our haplotype words from 0 .. nSites - 1, stopping when no more shared alleles found
 		// Note that the longer our allele, the more entropy it contains, and therefore when we reach a point
@@ -432,37 +428,25 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 		// At each row, we will have to track # of unique haplotypes for the forward and back passes
 		// when uniqueHaps == nSamples
-		// nForwdHaps := 0
-		// nBackwHaps := 0
 		var chr string
+		var maxEntropy int
 		for rowIdx, row := range genotypes {
 			chr = row[0]
 
 			// We do
 			// Single site pass:
 			// ---------x
-			// Forward pass
-			// xxxxxxxxxx
-			// stop forward when numHaplotypes == numChromosomes
-			// and never do another forward pass
-			// Partial forward pass is equivalent to a backward pass
-			// xx--------
-			// -xx-------
-			// -xxx------
-			// -xxxx-----
 			// Backward pass   :
 			// --------xx
 			// -------xxx
 			// ------xxxx
 			// etc
-			// stop backward pass when numHaplotypes == numChromosomes
-			// Once we've stopped the backward pass, all future backward passes
-			// can stop at the start index of the stopped pass
-			// i.e if at pos 60 we detect stopping position (i.e we get to say pos 2 and
-			// there are nChrom haplotypes defined by the sequence pos 2 .. pos 60
-			// for pos 61, we need only evaluates pos 60 .. pos 61
-			// Let's do backward pass first
+			// stop backward pass when all haplotypes (unique) are private
+			// Once we've stopped the backward pass, backward passes longer than the
+			// length of that all-private allele are skipped/break
 
+			//Build the vector for each sample, since haplotypes consist of this vector
+			//over some start .. stop
 			for i := 5; i < len(row); i++ {
 				// Build up the sequence
 				// We do this for all sites, even after only 1 sample has every haplotype,
@@ -471,7 +455,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 			}
 
 			// iterate overall of the samples, setting each sample's column as the "seqence"
-			// then for every other sample, calculate a diff; that diff is a binary tree
+			// then for every other sample, calculate a diff; that diff is a binary tree "word"
 
 			// We grow the tree starting from the rootSample
 			// Then, at each sample, we calculate the diff between it and rootSample
@@ -488,8 +472,6 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 			var hasShared bool
 			var hasDiff bool
 			var curr *node
-			// var isNewNode bool
-			var alt *allele
 		POINT:
 			for rootIdx, rootSample := range sampleGenos {
 				// biallelic only
@@ -505,23 +487,16 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 				seenHap = append(seenHap, rootSample[rowIdx])
 
-				// log.Println(len(seenHap), seenHap)
-				// start with the root, it simply anchors us, so that we can grow one large tree
-				// rather than many trees
+				// we start from the top
 				curr = root
 
-				// This builds the "word", aka the full diff state across all columns
-				// aka across all 2N chromosomes
+				// Build the word, checking for uniqueness
 				hasShared = false
 				hasDiff = false
 				for sIdx, sample := range sampleGenos {
 					// Handle the point pass, with start == rowIdx stop == rowIdx
 					// Update currPoint to keep moving down the tree
 					curr = updateTree(curr, rowIdx, rowIdx, rootSample, sample, rootIdx == sIdx)
-
-					// if isNewNode && sIdx == len(sampleGenos)-1 {
-					// 	atomic.AddUint64(&updates, 1)
-					// }
 
 					if sIdx == rootIdx {
 						continue
@@ -535,25 +510,25 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 						continue
 					}
 
-					// currPoint.val == 0
+					// currPoint.val == 0 here
 					if !hasDiff {
 						hasDiff = true
 					}
 				}
 
-				// Remove alleles where all samples homogenous
+				// Remove alleles where all samples homogenous and we cannot detect association
 				if hasShared && hasDiff {
 					results <- makeAllele(chr, rowIdx, rowIdx, curr)
-					// alleles = append(alleles, makeAllele(chr, rowIdx, rowIdx, curr))
 				}
 			}
 
-			// Forward pass; 0 .. rowIdx, 1 .. rowIdx, 2 .. rowIdx, etc
-			var maxEntropy int
+			// Backward pass; 2 .. rowIdx, 1 .. rowIdx,  0 .. rowIdx
+			// We may want to put this into a funciton, since so similar to above
+			// but I save a bit of time by not doing so since backward pass
+			// has slightly different needs (max entropy)
 			var rootAllele string
 			var seen map[string]bool
-
-			for start := 0; start < rowIdx; start++ {
+			for start := rowIdx - 1; start >= 0; start-- {
 				var uniqueCount int
 
 				if maxEntropy > 0 && rowIdx-start >= maxEntropy {
@@ -572,11 +547,6 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 					seen[rootAllele] = true
 
-					// if len(seen) > 400 {
-					// 	log.Println(unsafe.Sizeof(seen), len(seen))
-					// }
-
-					// started from the bottom
 					curr = root
 
 					hasShared = false
@@ -584,10 +554,6 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 					for sIdx, sample := range sampleGenos {
 						// now we're here
 						curr = updateTree(curr, start, rowIdx, rootSample, sample, rootIdx == sIdx)
-
-						// if isNewNode && sIdx == len(sampleGenos)-1 {
-						// 	atomic.AddUint64(&updates, 1)
-						// }
 
 						if sIdx == rootIdx {
 							continue
@@ -609,11 +575,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 					// to avoid needing to count # of shared alleles
 					if hasShared && hasDiff {
-						alt = makeAllele(chr, rowIdx, rowIdx, curr)
-						if alt.chr == "1" {
-
-						}
-						// alleles = append(alleles, makeAllele(chr, start, rowIdx, curr))
+						results <- makeAllele(chr, rowIdx, rowIdx, curr)
 						continue
 					}
 
