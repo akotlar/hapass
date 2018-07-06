@@ -223,10 +223,10 @@ func read(config *config, hPath string, sPath string, btree *node, resultFunc fu
 	// sample: [geno1 array, geno2 array]
 	// we use buffered channels
 	// https://stackoverflow.com/questions/45366954/golang-channel-wierd-deadlock-related-with-make?rq=1
-	genotypeQueue := make(chan [][]string, 1000)
+	genotypeQueue := make(chan [][]string)
 
 	// The haplotypes, with sample counts, for a given sub chr
-	results := make(chan *allele, 1000)
+	results := make(chan *allele, 50)
 	// var wg sync.WaitGroup
 
 	var wg sync.WaitGroup
@@ -592,6 +592,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 			}
 		}
 
+		// For this to work, uncomment some stuff above
 		numUpdates := atomic.LoadUint64(&updates)
 		log.Println("Done with this many tree updates: ", numUpdates, " for this many sites", nSites)
 	}
