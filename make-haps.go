@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ type config struct {
 	hPath      string
 	sPath      string
 	maxThreads int
+	cpuProfile string
 }
 
 type node struct {
@@ -36,10 +38,10 @@ type node struct {
 }
 
 type allele struct {
-	chr   string
-	start uint16
-	stop  uint16
-	id    uint16
+	chr string
+	// start uint16
+	// stop  uint16
+	// id    uint16
 
 	// The final combination; will walk up the tree using parentNode to actually get the full word, to avoid storing it
 	// SO FUCKING COOL!
@@ -55,7 +57,9 @@ func setup(args []string) *config {
 	config := &config{}
 	flag.StringVar(&config.hPath, "haps", "", "The pattern of haps files")
 	flag.StringVar(&config.sPath, "sample", "", "The pattern of samples files")
-	flag.IntVar(&config.maxThreads, "threads", 8, "Num threads")
+	flag.IntVar(&config.maxThreads, "threads", runtime.GOMAXPROCS(0), "Num threads")
+	flag.IntVar(&config.cpuProfile, "cprof", "", "Cpu profile path")
+
 	// allows args to be mocked https://github.com/nwjlyons/email/blob/master/inputs.go
 	// can only run 1 such test, else, redefined flags error
 	a := os.Args[1:]
@@ -74,6 +78,19 @@ func init() {
 
 func main() {
 	config := setup(nil)
+
+    if config.cprof != "" {
+        f, err := os.Create(*cpuProfile)
+        if err != nil {
+            log.Fatal(err)
+        }
+        pprof.StartCPUProfile(f)
+        defer pprof.StopCPUProfile()
+    }
+
+	if config.maxThreads > runtime.GOMAXPROCS(0) {
+		runtime.GOMAXPROCS(config.maxThreads)
+	}
 
 	hapsFiles, err := filepath.Glob(config.hPath)
 
@@ -223,10 +240,10 @@ func read(config *config, hPath string, sPath string, btree *node, resultFunc fu
 	// sample: [geno1 array, geno2 array]
 	// we use buffered channels
 	// https://stackoverflow.com/questions/45366954/golang-channel-wierd-deadlock-related-with-make?rq=1
-	genotypeQueue := make(chan [][]string)
+	genotypeQueue := make(chan [][]string, 1000)
 
 	// The haplotypes, with sample counts, for a given sub chr
-	results := make(chan *allele, 50)
+	results := make(chan *allele, 1000)
 	// var wg sync.WaitGroup
 
 	var wg sync.WaitGroup
@@ -387,7 +404,7 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- *allele, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// Each sample is of the length of the full genotype
-
+	// runtime.GOMAXPROCS(20)
 	// A new item in the queue is in fact the entire cluster, block, of <= blockSize (default 1e6)
 	// Genotypes contains a list of rows, of 2N + 5 length, exact length as .tped file
 	// The first 4 columns are chr, id, pos, allele sequence,
@@ -429,7 +446,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 		// At each row, we will have to track # of unique haplotypes for the forward and back passes
 		// when uniqueHaps == nSamples
 		var chr string
-		var maxEntropy int
+		// var maxEntropy int
 		for rowIdx, row := range genotypes {
 			chr = row[0]
 
@@ -518,7 +535,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 				// Remove alleles where all samples homogenous and we cannot detect association
 				if hasShared && hasDiff {
-					results <- makeAllele(chr, rowIdx, rowIdx, curr)
+					results <- makeAllele(chr, curr)
 				}
 			}
 
@@ -527,68 +544,73 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 			// but I save a bit of time by not doing so since backward pass
 			// has slightly different needs (max entropy)
 			var rootAllele string
-			var seen map[string]bool
+			var uniqueCount uint32
+			var wg2 sync.WaitGroup
 			for start := rowIdx - 1; start >= 0; start-- {
-				var uniqueCount int
+				wg2.Add(1)
 
-				if maxEntropy > 0 && rowIdx-start >= maxEntropy {
-					log.Println("HIT maxEntropy")
-					continue
-				}
+				go func(start, stop int) {
+					defer wg2.Done()
+					seen := make(map[string]bool)
+					// if maxEntropy > 0 && rowIdx-start >= maxEntropy {
+					// 	log.Println("HIT maxEntropy")
+					// 	continue
+					// }
 
-				seen = make(map[string]bool)
-				for rootIdx, rootSample := range sampleGenos {
-					// while kind of a slow step, saves a huge amount of computation
-					// since most haplotypes will be shared
-					rootAllele = string(rootSample[start : rowIdx+1])
-					if seen[rootAllele] == true {
-						continue
-					}
-
-					seen[rootAllele] = true
-
-					curr = root
-
-					hasShared = false
-					hasDiff = false
-					for sIdx, sample := range sampleGenos {
-						// now we're here
-						curr = updateTree(curr, start, rowIdx, rootSample, sample, rootIdx == sIdx)
-
-						if sIdx == rootIdx {
+					for rootIdx, rootSample := range sampleGenos {
+						// while kind of a slow step, saves a huge amount of computation
+						// since most haplotypes will be shared
+						rootAllele = string(rootSample[start : stop+1])
+						if seen[rootAllele] == true {
 							continue
 						}
 
-						if curr.val == 1 {
-							if !hasShared {
-								hasShared = true
+						seen[rootAllele] = true
+
+						curr := root
+
+						hasShared := false
+						hasDiff := false
+						for sIdx, sample := range sampleGenos {
+							// now we're here
+							curr = updateTree(curr, start, stop, rootSample, sample, rootIdx == sIdx)
+
+							if sIdx == rootIdx {
+								continue
 							}
 
-							continue
+							if curr.val == 1 {
+								if !hasShared {
+									hasShared = true
+								}
+
+								continue
+							}
+
+							// currPoint.val == 0
+							if !hasDiff {
+								hasDiff = true
+							}
 						}
 
-						// currPoint.val == 0
-						if !hasDiff {
-							hasDiff = true
+						// to avoid needing to count # of shared alleles
+						if hasShared && hasDiff {
+							results <- makeAllele(chr, curr)
+						}
+
+						if !hasShared {
+							atomic.AddUint32(&uniqueCount, 1)
 						}
 					}
+				}(start, rowIdx)
 
-					// to avoid needing to count # of shared alleles
-					if hasShared && hasDiff {
-						results <- makeAllele(chr, rowIdx, rowIdx, curr)
-						continue
-					}
-
-					if !hasShared {
-						uniqueCount++
-					}
-				}
-
-				if uniqueCount == len(seen) {
-					log.Println(len(seen), uniqueCount)
-					log.Println("ALL UNIQUE", uniqueCount, len(seen))
-					maxEntropy = rowIdx - start
-				}
+				wg2.Wait()
+				// log.Println(int(atomic.LoadUint32(&uniqueCount)), len(seen))
+				// if int(atomic.LoadUint32(&uniqueCount)) == len(seen) {
+				// 	log.Println(len(seen), uniqueCount)
+				// 	log.Println("ALL UNIQUE", uniqueCount, len(seen))
+				// 	maxEntropy = rowIdx - start
+				// }
 			}
 		}
 
@@ -605,12 +627,67 @@ func reverse(s string) (result string) {
 	return
 }
 
-func makeAllele(chr string, start, stop int, finalNode *node) *allele {
+func processSite(start, stop int) {
+	defer wg2.Done()
+	seen := make(map[string]bool)
+	// if maxEntropy > 0 && rowIdx-start >= maxEntropy {
+	// 	log.Println("HIT maxEntropy")
+	// 	continue
+	// }
+
+	for rootIdx, rootSample := range sampleGenos {
+		// while kind of a slow step, saves a huge amount of computation
+		// since most haplotypes will be shared
+		rootAllele = string(rootSample[start : stop+1])
+		if seen[rootAllele] == true {
+			continue
+		}
+
+		seen[rootAllele] = true
+
+		curr := root
+
+		hasShared := false
+		hasDiff := false
+		for sIdx, sample := range sampleGenos {
+			// now we're here
+			curr = updateTree(curr, start, stop, rootSample, sample, rootIdx == sIdx)
+
+			if sIdx == rootIdx {
+				continue
+			}
+
+			if curr.val == 1 {
+				if !hasShared {
+					hasShared = true
+				}
+
+				continue
+			}
+
+			// currPoint.val == 0
+			if !hasDiff {
+				hasDiff = true
+			}
+		}
+
+		// to avoid needing to count # of shared alleles
+		if hasShared && hasDiff {
+			results <- makeAllele(chr, curr)
+		}
+
+		if !hasShared {
+			atomic.AddUint32(&uniqueCount, 1)
+		}
+	}
+}(start, rowIdx)
+
+func makeAllele(chr string, finalNode *node) *allele {
 	allele := new(allele)
 	allele.chr = chr
 	// allele.subChr = subChr
-	allele.start = uint16(start)
-	allele.stop = uint16(stop)
+	// allele.start = uint16(start)
+	// allele.stop = uint16(stop)
 	// allele.id = id
 	allele.finalNode = finalNode
 
