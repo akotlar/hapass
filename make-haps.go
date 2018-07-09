@@ -12,12 +12,16 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	// "unsafe"
 )
 
@@ -25,6 +29,7 @@ type config struct {
 	hPath      string
 	sPath      string
 	maxThreads int
+	cpuProfile string
 }
 
 type node struct {
@@ -36,10 +41,7 @@ type node struct {
 }
 
 type allele struct {
-	chr   string
-	start uint16
-	stop  uint16
-	id    uint16
+	chr string
 
 	// The final combination; will walk up the tree using parentNode to actually get the full word, to avoid storing it
 	// SO FUCKING COOL!
@@ -55,7 +57,9 @@ func setup(args []string) *config {
 	config := &config{}
 	flag.StringVar(&config.hPath, "haps", "", "The pattern of haps files")
 	flag.StringVar(&config.sPath, "sample", "", "The pattern of samples files")
-	flag.IntVar(&config.maxThreads, "threads", 8, "Num threads")
+	flag.IntVar(&config.maxThreads, "threads", runtime.GOMAXPROCS(0), "Num threads")
+	flag.StringVar(&config.cpuProfile, "cprof", "", "Cpu profile path")
+
 	// allows args to be mocked https://github.com/nwjlyons/email/blob/master/inputs.go
 	// can only run 1 such test, else, redefined flags error
 	a := os.Args[1:]
@@ -75,6 +79,38 @@ func init() {
 func main() {
 	config := setup(nil)
 
+	if config.cpuProfile != "" {
+		f, err := os.Create(config.cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	if config.maxThreads > runtime.GOMAXPROCS(0) {
+		runtime.GOMAXPROCS(config.maxThreads)
+	}
+
+	// https://stackoverflow.com/questions/11268943/is-it-possible-to-capture-a-ctrlc-signal-and-run-a-cleanup-function-in-a-defe
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	cleanup := func() {
+		log.Println("\n\nStopped early!\n\n")
+		pprof.StopCPUProfile()
+	}
+
+	go func() {
+		<-c
+		cleanup()
+		os.Exit(1)
+	}()
+
+	run(config)
+}
+
+func run(config *config) {
 	hapsFiles, err := filepath.Glob(config.hPath)
 
 	if err != nil {
@@ -142,7 +178,7 @@ func main() {
 	}
 }
 
-func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(word *allele), completer func()) {
+func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(words []*allele), completer func()) {
 	log.Println("CALLED WITH THIS MANY SAMPLES", len(samples), baseChr)
 
 	// chr := baseChr
@@ -168,50 +204,52 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 	}
 
 	var id int
-	accumulator = func(alt *allele) {
-		// log.Println("Called accumulator", alt)
+	accumulator = func(alts []*allele) {
+		for _, alt := range alts {
+			// log.Println("Called accumulator", alt)
 
-		id++
+			id++
 
-		id := strconv.Itoa(id)
-		// Write the haplotype to the map file
-		// place into func
-		var l bytes.Buffer
-		l.WriteString(alt.chr)
-		l.WriteString("\t")
-		l.WriteString(id)
-		l.WriteString("\t")
-		// centimorgans... dummy
-		l.WriteString("0")
-		l.WriteString("\t")
-		// position is basically a position; the positions aren't real
-		// they're the order of the haplotypes we generate
-		l.WriteString(id)
-
-		wordNode := alt.finalNode
-		for {
+			id := strconv.Itoa(id)
+			// Write the haplotype to the map file
+			// place into func
+			var l bytes.Buffer
+			l.WriteString(alt.chr)
 			l.WriteString("\t")
+			l.WriteString(id)
+			l.WriteString("\t")
+			// centimorgans... dummy
+			l.WriteString("0")
+			l.WriteString("\t")
+			// position is basically a position; the positions aren't real
+			// they're the order of the haplotypes we generate
+			l.WriteString(id)
 
-			if wordNode.val == 0 {
-				l.WriteString("0")
-			} else {
-				l.WriteString("1")
+			wordNode := alt.finalNode
+			for {
+				l.WriteString("\t")
+
+				if wordNode.val == 0 {
+					l.WriteString("0")
+				} else {
+					l.WriteString("1")
+				}
+
+				if wordNode.parent == nil {
+					break
+				}
+
+				wordNode = wordNode.parent
 			}
 
-			if wordNode.parent == nil {
-				break
-			}
-
-			wordNode = wordNode.parent
+			mWriter.WriteString(l.String())
 		}
-
-		mWriter.WriteString(l.String())
 	}
 
 	return accumulator, completer
 }
 
-func read(config *config, hPath string, sPath string, btree *node, resultFunc func(alt *allele)) {
+func read(config *config, hPath string, sPath string, btree *node, resultFunc func(alts []*allele)) {
 	reader, err := getReader(hPath)
 
 	if err != nil {
@@ -223,11 +261,10 @@ func read(config *config, hPath string, sPath string, btree *node, resultFunc fu
 	// sample: [geno1 array, geno2 array]
 	// we use buffered channels
 	// https://stackoverflow.com/questions/45366954/golang-channel-wierd-deadlock-related-with-make?rq=1
-	genotypeQueue := make(chan [][]string)
+	genotypeQueue := make(chan [][]string, 100)
 
 	// The haplotypes, with sample counts, for a given sub chr
-	results := make(chan *allele, 50)
-	// var wg sync.WaitGroup
+	results := make(chan []*allele, 100)
 
 	var wg sync.WaitGroup
 
@@ -308,6 +345,7 @@ func getReader(fPath string) (*bufio.Reader, error) {
 	return reader, err
 }
 
+// Read a file and make haplotype blocks
 func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 	// How big the haplotype blocks are
 	blockSize := int(1e6)
@@ -347,70 +385,44 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 
 			// process the genotypes from this sub chromosome into haplotypes
 			if len(records) > 0 {
+				log.Println("Sending this many sites: ", len(records))
 				genotypeQueue <- records
 			}
 
 			records = [][]string{}
-
-			// fmt.Println("Made new", row[0], lastStart, pos)
 		}
 
-		// prefixes[subChr] = append(prefixes[subChr], record[:5])
 		records = append(records, record)
 	}
 
 	if len(records) > 0 {
+		fmt.Println("Sending remaining sites: ", lastStart, subChrCutoff, len(records))
 		genotypeQueue <- records
 	}
 
 	close(genotypeQueue)
 }
 
-// This function may go away; it takes an nSites by nAlleles matrix
-// Note that nAlleles == 2nSamples
-// Then, from index 0, figure out haplotype "words", where a word is the across-sample (i.e 2nSamples) diff
-// This diff is stored in unbalanced binary tree
-// The tree root is the allele chosen to diff against. Effectively it is a "1"
-// The tree's first split is made by looking at the next allele (this one is from the same sample)
-// If that allele is equivalent to the root allele, the tree "splits" right (i.e. gets a new Node assign to its .rNode)
-// If that allele is not equivalent to the root allele, the tree "splits" left, by assigning .lNode a new Node
-// And so on
-// When we've done this 2N times, we store the last node (the leaf), to a new object, an allele instance of Allele
-// I failed to mention: the tree is doubly linked: each node points to the parent as well as the child
-// Then, when it is time to write out genotypes, we iterates over alleles <[]Allele>
-// And walk up the tree to write out 2N values; for each "right split" we write a 1, for each "left split" we write a 0
-// The idea here is that these trees, by being the diff against a "root" allele, will tend to recur,
-// because the forces that shape the identity by state characteristic of a single locus, is effectively equivalent
-// to that across nodes, i.e "haplotypes" in a phased system
-// The stopping condition here is when there are 2N diffs at a single "locus" (start M to end N > M), meaning all haplotypes
-// are unique, and therefore we have no power to detect association
-func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- *allele, wg *sync.WaitGroup) {
+// Process the haplotype blocks into haplotypes that are defined
+// by slices of each sample's column vector over some range within that block
+// then build a binary tree (shared across all threads) that diffs
+// against every other sample's vector slice, tracking diffs to avoid overwork
+func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- []*allele, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// Each sample is of the length of the full genotype
-
 	// A new item in the queue is in fact the entire cluster, block, of <= blockSize (default 1e6)
 	// Genotypes contains a list of rows, of 2N + 5 length, exact length as .tped file
 	// The first 4 columns are chr, id, pos, allele sequence,
 	// int because more costly to convert int16 or uint16 to string; cannot use strconv.Itoa or strconf.FormatInt
 	for genotypes := range genotypeQueue {
-		// subChr++
-		// root := new(node)
-		// var alleles []*allele
-
 		// lSiteIdx := len(genotypes) - 1
 		nSites := len(genotypes)
 
-		// log.Println("launched with this many sites", nSites)
+		log.Println("Received this many sites: ", nSites)
 		// log.Println(genotypes[0])
 		nSamples := len(genotypes[0]) - 5
-		// lSampIdx := nSamples - 1
 
 		// these are the 2N samples, i.e all chromosomes
 		// which matches nicely to the .tped format of 2 columns per sample, in .fam order
-		// sampleGenos are column vectors: the accumulations of genotypes across all rows
-		// we typically won't build the maximum vector, since at some point only 1 sample will exist
-		// per "haplotype"
-		// Is sample-wise
 		sampleGenos := make([][]byte, nSamples, nSamples)
 
 		// Just build a vector of sites for
@@ -418,32 +430,13 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 			sampleGenos[i] = make([]byte, nSites, nSites)
 		}
 
-		// We begin constructing our haplotype words from 0 .. nSites - 1, stopping when no more shared alleles found
-		// Note that the longer our allele, the more entropy it contains, and therefore when we reach a point
-		// where there are no shared alleles, we have hit maximum entropy, and there is no sense in continuing, except maybe
-		// if we're cold
-		// lastStart := 0
-		// var start int
-		// var stop int
-
-		// At each row, we will have to track # of unique haplotypes for the forward and back passes
-		// when uniqueHaps == nSamples
 		var chr string
-		var maxEntropy int
+		var hasShared bool
+		var hasDiff bool
+		var curr *node
+		var alleles []*allele
 		for rowIdx, row := range genotypes {
 			chr = row[0]
-
-			// We do
-			// Single site pass:
-			// ---------x
-			// Backward pass   :
-			// --------xx
-			// -------xxx
-			// ------xxxx
-			// etc
-			// stop backward pass when all haplotypes (unique) are private
-			// Once we've stopped the backward pass, backward passes longer than the
-			// length of that all-private allele are skipped/break
 
 			//Build the vector for each sample, since haplotypes consist of this vector
 			//over some start .. stop
@@ -457,95 +450,26 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 			// iterate overall of the samples, setting each sample's column as the "seqence"
 			// then for every other sample, calculate a diff; that diff is a binary tree "word"
 
-			// We grow the tree starting from the rootSample
-			// Then, at each sample, we calculate the diff between it and rootSample
-			// if their haplotypes are identical, we split to the right and set node.val = 1
-			// if their haplotypes differ, we split left, and set node.val = 0
+			// This is done in a backward pass, starting from rowIdx:
+			// ---------x (rowIdx)
+			// --------xx
+			// -------xxx
+			// ------xxxx
+			// We stop when we hit max entropy (all alleles are unique)
 
-			// Haplotype generation loop; 2 steps:
-			// 1) Since each sample column represents a haplotype
-			// iterate over each sample, setting that column as the reference
-			// 2) Iterate over all but that "reference" sample, computing the diff "word"
-			// That word is a tree, with all of the pairwise differences
-			// Notice that the word always starts with a "1"
-			var seenHap []byte
-			var hasShared bool
-			var hasDiff bool
-			var curr *node
-		POINT:
-			for rootIdx, rootSample := range sampleGenos {
-				// biallelic only
-				if len(seenHap) >= 2 {
-					break
-				}
+			// Each loop of INNER gives a set of haplotypes of len(rowIdx - start + 1)
+		INNER:
+			for start := rowIdx; start >= 0; start-- {
+				samplesToSkip := make([]bool, len(sampleGenos))
 
-				for _, alt := range seenHap {
-					if alt == rootSample[rowIdx] {
-						continue POINT
-					}
-				}
-
-				seenHap = append(seenHap, rootSample[rowIdx])
-
-				// we start from the top
-				curr = root
-
-				// Build the word, checking for uniqueness
-				hasShared = false
-				hasDiff = false
-				for sIdx, sample := range sampleGenos {
-					// Handle the point pass, with start == rowIdx stop == rowIdx
-					// Update currPoint to keep moving down the tree
-					curr = updateTree(curr, rowIdx, rowIdx, rootSample, sample, rootIdx == sIdx)
-
-					if sIdx == rootIdx {
-						continue
-					}
-
-					if curr.val == 1 {
-						if !hasShared {
-							hasShared = true
-						}
-
-						continue
-					}
-
-					// currPoint.val == 0 here
-					if !hasDiff {
-						hasDiff = true
-					}
-				}
-
-				// Remove alleles where all samples homogenous and we cannot detect association
-				if hasShared && hasDiff {
-					results <- makeAllele(chr, rowIdx, rowIdx, curr)
-				}
-			}
-
-			// Backward pass; 2 .. rowIdx, 1 .. rowIdx,  0 .. rowIdx
-			// We may want to put this into a funciton, since so similar to above
-			// but I save a bit of time by not doing so since backward pass
-			// has slightly different needs (max entropy)
-			var rootAllele string
-			var seen map[string]bool
-			for start := rowIdx - 1; start >= 0; start-- {
-				var uniqueCount int
-
-				if maxEntropy > 0 && rowIdx-start >= maxEntropy {
-					log.Println("HIT maxEntropy")
-					continue
-				}
-
-				seen = make(map[string]bool)
+				// rootSample[start .. rowIdx] is a haplotype
+				var sharedCount int
+				var skipCount int
 				for rootIdx, rootSample := range sampleGenos {
-					// while kind of a slow step, saves a huge amount of computation
-					// since most haplotypes will be shared
-					rootAllele = string(rootSample[start : rowIdx+1])
-					if seen[rootAllele] == true {
+					if samplesToSkip[rootIdx] == true {
+						skipCount++
 						continue
 					}
-
-					seen[rootAllele] = true
 
 					curr = root
 
@@ -564,32 +488,42 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 								hasShared = true
 							}
 
+							// If the sample has a shared value, no need to ever
+							// check it again
+							samplesToSkip[sIdx] = true
+							sharedCount++
 							continue
 						}
 
-						// currPoint.val == 0
+						// currPoint.val == 0 here
 						if !hasDiff {
 							hasDiff = true
 						}
+
 					}
 
+					// log.Println(skipCount, len(alleles))
 					// to avoid needing to count # of shared alleles
 					if hasShared && hasDiff {
-						results <- makeAllele(chr, rowIdx, rowIdx, curr)
+						allele := new(allele)
+						allele.chr = chr
+						allele.finalNode = curr
+
+						alleles = append(alleles, allele)
 						continue
 					}
 
-					if !hasShared {
-						uniqueCount++
-					}
 				}
 
-				if uniqueCount == len(seen) {
-					log.Println(len(seen), uniqueCount)
-					log.Println("ALL UNIQUE", uniqueCount, len(seen))
-					maxEntropy = rowIdx - start
+				// reached max entropy, no need to go further for this rowIdx
+				if sharedCount == 0 {
+					break INNER
 				}
 			}
+		}
+
+		if len(alleles) > 0 {
+			results <- alleles
 		}
 
 		// For this to work, uncomment some stuff above
@@ -598,27 +532,21 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 	}
 }
 
-func reverse(s string) (result string) {
-	for _, v := range s {
-		result = string(v) + result
-	}
-	return
-}
+// func reverse(s string) (result string) {
+// 	for _, v := range s {
+// 		result = string(v) + result
+// 	}
+// 	return
+// }
 
-func makeAllele(chr string, start, stop int, finalNode *node) *allele {
-	allele := new(allele)
-	allele.chr = chr
-	// allele.subChr = subChr
-	allele.start = uint16(start)
-	allele.stop = uint16(stop)
-	// allele.id = id
-	allele.finalNode = finalNode
+// func makeAllele(chr string, finalNode *node) *allele {
+// 	allele := new(allele)
+// 	allele.chr = chr
+// 	allele.finalNode = finalNode
 
-	return allele
-}
+// 	return allele
+// }
 
-// can further simplify this, not sure of the overheda, by putting into function the
-// code to check if present or updae
 func updateTree(btree *node, start, stop int, ref, alt []byte, isRef bool) *node {
 	// sample index identical to the reference sample index, so obviously identical
 	if !isRef {
@@ -645,7 +573,6 @@ func updateTree(btree *node, start, stop int, ref, alt []byte, isRef bool) *node
 	}
 
 	// atomic.AddUint64(&updates, 1)
-	// if not, make one, and assign it
 	return newNode(btree, 1)
 }
 
@@ -666,11 +593,8 @@ func newNode(btree *node, val uint8) *node {
 	} else {
 		btree.right = nNode
 	}
-	// log.Println(btree.right, nNode)
 
 	btree.Unlock()
-
-	// log.Println(btree.right, nNode)
 
 	return nNode
 }
@@ -678,13 +602,10 @@ func newNode(btree *node, val uint8) *node {
 // mutex unlocks in function scope;
 // we can get rid of the function if it really leads to noticeable performance overhead
 func getNode(btree *node, val uint8) *node {
-	btree.RLock()
-	// defer btree.RUnlock()
-	// Maybe can do without an assignment here, using defer btree.RUnlock(),
-	// but that may be no faster, since defer has overhead,
-	// and not clear to me yet when the lock will release (before return, or after?,
-	// and if after, is the returend btree.left or btree.right subject to a race condition?
 	var n *node
+
+	btree.RLock()
+	// Manually manage locks, beceause defer takes longer
 	if val == 0 {
 		n = btree.left
 	} else {
