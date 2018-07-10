@@ -50,6 +50,10 @@ type allele struct {
 	finalNode *node
 }
 
+const diffVal = byte('0')
+const sameVal = byte('1')
+const tabVal = byte('\t')
+
 // track updates to tree
 var updates uint64
 
@@ -107,6 +111,7 @@ func main() {
 		os.Exit(1)
 	}()
 
+	log.Println("ALT VALUE", diffVal, sameVal)
 	run(config)
 }
 
@@ -178,6 +183,8 @@ func run(config *config) {
 	}
 }
 
+// Generates a write function that must be called from a single thread
+// for a single file
 func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(words []*allele), completer func()) {
 	log.Println("CALLED WITH THIS MANY SAMPLES", len(samples), baseChr)
 
@@ -203,46 +210,71 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 		}
 	}
 
+	nAlleles := len(samples) * 2
+
+	// since samples is fixed for any call to createWriteFunc,
+	// we can expect (but will check)
+	// that each word is of same length
+	// and can therefore write this once, and over-write
+	// Since we need tab characters, we double that once - 1
+	word := make([]byte, nAlleles*2-1)
+	for i := 1; i < len(word); i += 2 {
+		word[i] = tabVal
+	}
+
+	// log.Println("word is length", word)
 	var id int
+	var idStr string
+
 	accumulator = func(alts []*allele) {
 		for _, alt := range alts {
-			// log.Println("Called accumulator", alt)
-
+			// log.Println("Called accumulator", len)
 			id++
 
-			id := strconv.Itoa(id)
+			idStr = strconv.Itoa(id)
 			// Write the haplotype to the map file
 			// place into func
-			var l bytes.Buffer
-			l.WriteString(alt.chr)
-			l.WriteString("\t")
-			l.WriteString(id)
-			l.WriteString("\t")
+			// var l bytes.Buffer
+			mWriter.WriteString(alt.chr)
+			mWriter.WriteString("\t")
+			mWriter.WriteString(idStr)
+			mWriter.WriteString("\t")
 			// centimorgans... dummy
-			l.WriteString("0")
-			l.WriteString("\t")
+			mWriter.WriteString("0")
+			mWriter.WriteString("\t")
 			// position is basically a position; the positions aren't real
 			// they're the order of the haplotypes we generate
-			l.WriteString(id)
+			mWriter.WriteString(idStr)
 
+			// Build the allele slice backwards, since we operate
+			// from leaf of the binary tree
+			// Every other (from index 0) entry is an allele diff (1 has, 0 no)
+			// Every other (from index 1) entry is a byte('\t)
+			// We track the number of values in the alt *allele
+			// to ensure that we overwrite every allele entry
 			wordNode := alt.finalNode
+			i := len(word) - 1
 			for {
-				l.WriteString("\t")
-
-				if wordNode.val == 0 {
-					l.WriteString("0")
-				} else {
-					l.WriteString("1")
-				}
-
 				if wordNode.parent == nil {
 					break
 				}
 
+				// log.Println(i)
+				word[i] = wordNode.val
+
 				wordNode = wordNode.parent
+				i -= 2
 			}
 
-			mWriter.WriteString(l.String())
+			// i should be -2 since decrement runs one extra time
+			if i != -2 {
+				log.Fatal("Word length must equal sample length: ", nAlleles, " got: ", i)
+			}
+
+			mWriter.WriteString("\t")
+			mWriter.Write(word)
+			mWriter.WriteString("\n")
+			// mWriter.WriteString(l.String())
 		}
 	}
 
@@ -283,6 +315,7 @@ func read(config *config, hPath string, sPath string, btree *node, resultFunc fu
 		close(results)
 	}()
 
+	// Called sequentially; critical that this is not multithreaded
 	for chrHaps := range results {
 		// fmt.Println(chrHaps)
 		resultFunc(chrHaps)
@@ -419,6 +452,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 		log.Println("Received this many sites: ", nSites)
 		// log.Println(genotypes[0])
+		// 5 non-sample fields
 		nSamples := len(genotypes[0]) - 5
 
 		// these are the 2N samples, i.e all chromosomes
@@ -483,7 +517,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 							continue
 						}
 
-						if curr.val == 1 {
+						if curr.val == sameVal {
 							if !hasShared {
 								hasShared = true
 							}
@@ -495,7 +529,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 							continue
 						}
 
-						// currPoint.val == 0 here
+						// currPoint.val == diffVal here
 						if !hasDiff {
 							hasDiff = true
 						}
@@ -557,26 +591,28 @@ func updateTree(btree *node, start, stop int, ref, alt []byte, isRef bool) *node
 
 			// we found a difference, alt != ref which means a "left" split
 			// if we already have a left split, returned that node
-			if left := getNode(btree, 0); left != nil {
+			if left := getNode(btree, diffVal); left != nil {
 				return left
 			}
 
 			// atomic.AddUint64(&updates, 1)
-			return newNode(btree, 0)
+			return newNode(btree, diffVal)
 		}
 	}
 
 	// the ref and alt are identical over start .. stop
 	// if we already have a left split, returned that node
-	if right := getNode(btree, 1); right != nil {
+	if right := getNode(btree, sameVal); right != nil {
 		return right
 	}
 
 	// atomic.AddUint64(&updates, 1)
-	return newNode(btree, 1)
+	return newNode(btree, sameVal)
 }
 
-func newNode(btree *node, val uint8) *node {
+// note that byte and uint8 are equivalent
+// just using byte to suggest it's a value meant to be written asis
+func newNode(btree *node, val byte) *node {
 	nNode := new(node)
 	nNode.val = val
 
@@ -588,7 +624,7 @@ func newNode(btree *node, val uint8) *node {
 	// state is here, as long as it isn't deleted
 	nNode.parent = btree
 
-	if val == 0 {
+	if val == diffVal {
 		btree.left = nNode
 	} else {
 		btree.right = nNode
@@ -601,12 +637,12 @@ func newNode(btree *node, val uint8) *node {
 
 // mutex unlocks in function scope;
 // we can get rid of the function if it really leads to noticeable performance overhead
-func getNode(btree *node, val uint8) *node {
+func getNode(btree *node, val byte) *node {
 	var n *node
 
 	btree.RLock()
 	// Manually manage locks, beceause defer takes longer
-	if val == 0 {
+	if val == diffVal {
 		n = btree.left
 	} else {
 		n = btree.right
