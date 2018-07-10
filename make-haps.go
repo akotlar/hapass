@@ -37,7 +37,7 @@ type node struct {
 	left   *node
 	right  *node
 	parent *node
-	val    uint8
+	val    byte
 }
 
 type allele struct {
@@ -47,7 +47,10 @@ type allele struct {
 	// SO FUCKING COOL!
 	// In the case of a single position "haplotype" (start == stop), this is the allele of 2N chromosomes (N diploid samples)
 	// In the case of a multiple position haplotype (start < stop), this is whether sample N had this haplotype (1, else 0))
-	finalNode *node
+	// finalNode node
+
+	// can't pass node by value; will complain about passing locks
+	finalNodes []*node
 }
 
 const diffVal = byte('0')
@@ -185,7 +188,7 @@ func run(config *config) {
 
 // Generates a write function that must be called from a single thread
 // for a single file
-func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(words []*allele), completer func()) {
+func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(words allele), completer func()) {
 	log.Println("CALLED WITH THIS MANY SAMPLES", len(samples), baseChr)
 
 	// chr := baseChr
@@ -225,16 +228,20 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 	// log.Println("word is length", word)
 	var id int
 	var idStr string
-
-	accumulator = func(alts []*allele) {
-		for _, alt := range alts {
-			// log.Println("Called accumulator", len)
+	var i int
+	// Write the haplotype to the tped file
+	accumulator = func(alt allele) {
+		// Build the allele slice backwards, since we operate
+		// from leaf of the binary tree
+		// Every other (from index 0) entry is an allele diff (1 has, 0 no)
+		// Every other (from index 1) entry is a byte('\t)
+		// We track the number of values in the alt allele
+		// to ensure that we overwrite every allele entry
+		for _, wordNode := range alt.finalNodes {
 			id++
 
 			idStr = strconv.Itoa(id)
-			// Write the haplotype to the map file
-			// place into func
-			// var l bytes.Buffer
+
 			mWriter.WriteString(alt.chr)
 			mWriter.WriteString("\t")
 			mWriter.WriteString(idStr)
@@ -246,14 +253,7 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 			// they're the order of the haplotypes we generate
 			mWriter.WriteString(idStr)
 
-			// Build the allele slice backwards, since we operate
-			// from leaf of the binary tree
-			// Every other (from index 0) entry is an allele diff (1 has, 0 no)
-			// Every other (from index 1) entry is a byte('\t)
-			// We track the number of values in the alt *allele
-			// to ensure that we overwrite every allele entry
-			wordNode := alt.finalNode
-			i := len(word) - 1
+			i = len(word) - 1
 			for {
 				if wordNode.parent == nil {
 					break
@@ -274,14 +274,13 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 			mWriter.WriteString("\t")
 			mWriter.Write(word)
 			mWriter.WriteString("\n")
-			// mWriter.WriteString(l.String())
 		}
 	}
 
 	return accumulator, completer
 }
 
-func read(config *config, hPath string, sPath string, btree *node, resultFunc func(alts []*allele)) {
+func read(config *config, hPath string, sPath string, btree *node, resultFunc func(alts allele)) {
 	reader, err := getReader(hPath)
 
 	if err != nil {
@@ -296,7 +295,7 @@ func read(config *config, hPath string, sPath string, btree *node, resultFunc fu
 	genotypeQueue := make(chan [][]string, 100)
 
 	// The haplotypes, with sample counts, for a given sub chr
-	results := make(chan []*allele, 100)
+	results := make(chan allele, 100)
 
 	var wg sync.WaitGroup
 
@@ -440,7 +439,7 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 // by slices of each sample's column vector over some range within that block
 // then build a binary tree (shared across all threads) that diffs
 // against every other sample's vector slice, tracking diffs to avoid overwork
-func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- []*allele, wg *sync.WaitGroup) {
+func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- allele, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// A new item in the queue is in fact the entire cluster, block, of <= blockSize (default 1e6)
 	// Genotypes contains a list of rows, of 2N + 5 length, exact length as .tped file
@@ -468,7 +467,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 		var hasShared bool
 		var hasDiff bool
 		var curr *node
-		var alleles []*allele
+		var alleles []*node
 		for rowIdx, row := range genotypes {
 			chr = row[0]
 
@@ -536,14 +535,10 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 
 					}
 
-					// log.Println(skipCount, len(alleles))
 					// to avoid needing to count # of shared alleles
+					// TODO: grow slice in more controlled way
 					if hasShared && hasDiff {
-						allele := new(allele)
-						allele.chr = chr
-						allele.finalNode = curr
-
-						alleles = append(alleles, allele)
+						alleles = append(alleles, curr)
 						continue
 					}
 
@@ -557,7 +552,10 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 		}
 
 		if len(alleles) > 0 {
-			results <- alleles
+			results <- allele{
+				chr:        chr,
+				finalNodes: alleles,
+			}
 		}
 
 		// For this to work, uncomment some stuff above
@@ -573,7 +571,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, results chan<- 
 // 	return
 // }
 
-// func makeAllele(chr string, finalNode *node) *allele {
+// func makeAllele(chr string, finalNode *node) allele {
 // 	allele := new(allele)
 // 	allele.chr = chr
 // 	allele.finalNode = finalNode
