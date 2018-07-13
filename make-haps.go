@@ -34,13 +34,35 @@ type config struct {
 }
 
 type sequenceTree struct {
-	sync.RWMutex
-	// if this is a leaf/endpoint for some sequence, store the value
+	// This is a read-only structure, except for next
+	// which is a shared Map
+	// each node gets the allele it represents
 	val byte
 	// how many times this particular sequence has recurred
-	seen   uint32
-	next   map[byte]*sequenceTree
+	// Updated using atomic counter
+	seen uint32
+	// doubly linked
 	parent *sequenceTree
+	// this node maps to some other alleles as well in the chain
+	// next   sync.Map //keys are bytes, values are *sequenceTree
+	sync.Mutex
+	bases     []byte
+	next      []*sequenceTree
+	diffTrees []*node
+	diffSeen  []uint32
+}
+
+type sequenceTreeMap struct {
+	// This is a read-only structure, except for next
+	// which is a shared Map
+	// each node gets the allele it represents
+	val byte
+	// how many times this particular sequence has recurred
+	seen uint32
+	// this node maps to some other alleles as well in the chain
+	// next   sync.Map //keys are bytes, values are *sequenceTree
+	next   sync.Map
+	parent *sequenceTreeMap
 }
 
 type node struct {
@@ -50,7 +72,6 @@ type node struct {
 	parent *node
 	val    byte
 	seq    *sequenceTree
-	// seq    [][]byte
 }
 
 // type allele struct {
@@ -70,7 +91,7 @@ type alleles struct {
 
 	// can't pass node by value; will complain about passing locks
 	wordLeaves []*node
-	sequences  [][]byte
+	sequences  []*sequenceTree //[]byte
 	starts     []uint32
 }
 
@@ -271,7 +292,7 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 	// log.Println("word is length", word)
 	// var id int
 	// var idStr string
-	var i int
+	// var i int
 
 	// var wordNode *node
 	// var chr string
@@ -284,46 +305,46 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 		// We track the number of values in the alt allele
 		// to ensure that we overwrite every allele entry
 
-		for idx, wordNode := range alts.wordLeaves {
-			// id++
+		// for idx, wordNode := range alts.wordLeaves {
+		// 	// id++
 
-			// idStr = strconv.Itoa(id)
+		// 	// idStr = strconv.Itoa(id)
 
-			mWriter.WriteString(alts.chr)
-			mWriter.WriteString("\t")
-			mWriter.Write(decodeSequence(alts.sequences[idx]))
-			mWriter.WriteString("\t")
-			// centimorgans... dummy
-			mWriter.WriteString("0")
-			mWriter.WriteString("\t")
-			// position is basically a position; the positions aren't real
-			// they're the order of the haplotypes we generate
-			mWriter.WriteString(strconv.Itoa(int(alts.starts[idx])))
+		// 	mWriter.WriteString(alts.chr)
+		// 	mWriter.WriteString("\t")
+		// 	// mWriter.Write(decodeSequence(alts.sequences[idx]))
+		// 	mWriter.WriteString("\t")
+		// 	// centimorgans... dummy
+		// 	mWriter.WriteString("0")
+		// 	mWriter.WriteString("\t")
+		// 	// position is basically a position; the positions aren't real
+		// 	// they're the order of the haplotypes we generate
+		// 	mWriter.WriteString(strconv.Itoa(int(alts.starts[idx])))
 
-			i = len(word) - 1
-			seen := 0
-			for {
-				if wordNode.parent == nil {
-					break
-				}
+		// 	i = len(word) - 1
+		// 	seen := 0
+		// 	for {
+		// 		if wordNode.parent == nil {
+		// 			break
+		// 		}
 
-				// log.Println(i)
-				word[i] = wordNode.val
+		// 		// log.Println(i)
+		// 		word[i] = wordNode.val
 
-				wordNode = wordNode.parent
-				i -= 2
-				seen++
-			}
+		// 		wordNode = wordNode.parent
+		// 		i -= 2
+		// 		seen++
+		// 	}
 
-			// i should be -2 since decrement runs one extra time
-			if i != -2 {
-				log.Fatal("Word length must equal sample length: ", nAlleles, " got: ", i, "seen: ", seen)
-			}
+		// 	// i should be -2 since decrement runs one extra time
+		// 	if i != -2 {
+		// 		log.Fatal("Word length must equal sample length: ", nAlleles, " got: ", i, "seen: ", seen)
+		// 	}
 
-			mWriter.WriteString("\t")
-			mWriter.Write(word)
-			mWriter.WriteString("\n")
-		}
+		// 	mWriter.WriteString("\t")
+		// 	mWriter.Write(word)
+		// 	mWriter.WriteString("\n")
+		// }
 	}
 
 	return accumulator, completer
@@ -516,14 +537,16 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 
 		var chr string
 
-		var wordLeaves []*node
-		var sequences [][]uint8
+		// var wordLeaves []*node
+		var sequences []*sequenceTree
 		var starts []uint32
 		// var read int
 		// var alts [][]byte
 		// var alt []byte
 		// var alts []uint64
 		// var starts []uint32
+		var seenDiffs int
+		var seenAlleles int
 		for rowIdx, row := range genotypes {
 			chr = row[0]
 
@@ -579,14 +602,15 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 						continue
 					}
 
-					// seqLeaf, duplicateHap := getMakeSequence(stree, haplotypeBlock, start, rowIdx)
+					// seqLeaf, duplicateHap := getMakeSequenceMap(stree, haplotypeBlock, start, rowIdx)
 
 					// if duplicateHap == true {
+					// 	skipped++
 					// 	continue
 					// }
 
 					// log.Println(seqLeaf, duplicateHap)
-					// hapCount++
+					hapCount++
 
 					// allow more than 32,768 samples
 					var diffs int
@@ -595,7 +619,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 					// (are not references), so ok to modify
 					btree := root
 					// packed := []uint8
-				S_LOOP:
+
 					for j := 0; j < len(sampleGenos); j++ {
 						// if we're here, and the sample has had a haplotype
 						// identical to another, it is by definition impossible
@@ -623,7 +647,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 
 							btree = getMakeNode(btree, diffVal)
 
-							continue S_LOOP
+							break
 						}
 
 						// same, since haplotype[i] == sampleGenos[j][i] for all i
@@ -634,6 +658,7 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 					// If we're here, we've finished comparing all samples
 					// to 1 haplotype
 					// If that haplotype
+
 					if diffs >= nSamples {
 						log.Fatal("wtf", chr, start, rowIdx)
 					}
@@ -642,18 +667,19 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 					// if diffs == 0 {
 					// 	continue
 					// }
-
+					log.Println("Unique", diffs)
 					// Every sample unique, except reference
-					if diffs == nSamples-2 {
+					if diffs == nSamples-1 {
+						log.Println("Unique")
 						uniqueCount++
 					}
 
-					encoded := encodeSequence(haplotypeBlock, start, rowIdx)
+					// encoded := encodeSequence(haplotypeBlock, start, rowIdx)
 					// log.Println("\n\nEncoded: ", encoded)
 
 					// fmt.Printf("Value is %08b\n", seqPart)
 
-					sequences = append(sequences, encoded)
+					// sequences = append(sequences, seqLeaf)
 
 					// seq := decodeSequence(encoded)
 
@@ -666,7 +692,33 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 					// btree.seq = append(btree.seq, haplotypeBlock[start:rowIdx+1])
 					// btree.Unlock()
 
-					wordLeaves = append(wordLeaves, btree)
+					// if btree.seq == nil {
+					// 	btree.Lock()
+
+					// 	if btree.seq == nil {
+					// 		btree.seq = new(sequenceTree)
+					// 	}
+
+					// 	btree.Unlock()
+					// }
+
+					seq, seenBefore, diffSeen := getMakeSequenceAndAddNode(stree, btree, haplotypeBlock, start, rowIdx)
+
+					if diffSeen || seenBefore {
+						if diffSeen {
+							seenDiffs++
+						}
+
+						if seenBefore {
+							seenAlleles++
+						}
+
+						continue
+					}
+
+					sequences = append(sequences, seq)
+
+					// wordLeaves = append(wordLeaves, btree)
 					starts = append(starts, uint32(pos))
 					// zstd.Compress(stuff, haplotypeBlock[start:rowIdx+1])
 					// alts = append(alts, alt)
@@ -691,20 +743,25 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 				// 	alts = make([]allele, 0, bufferSize)
 				// }
 
-				if hapCount == uniqueCount {
-					log.Println("Reached max entropy", chr, start, rowIdx)
+				if hapCount > 0 && hapCount == uniqueCount {
+					log.Println("Reached max entropy", hapCount, uniqueCount, chr, start, rowIdx)
 					break WALK
 				}
 			}
 		}
 
-		results <- alleles{
-			chr:        chr,
-			wordLeaves: wordLeaves,
-			starts:     starts,
-			sequences:  sequences,
+		if len(sequences) > 0 {
+			results <- alleles{
+				chr: chr,
+				// wordLeaves: wordLeaves,
+				starts:    starts,
+				sequences: sequences,
+			}
+		} else {
+			log.Println("Nothing written: ", chr)
 		}
 
+		log.Printf("Alleles seen: %d, diffs seen %d", seenAlleles, seenDiffs)
 		// if len(alts) > 0 {
 		// 	results <- alleles{
 		// 		chr:  chr,
@@ -795,51 +852,171 @@ func decodeSequence(sequence []uint8) []byte {
 	return seq
 }
 
+func getMakeSequenceAndAddNode(stree *sequenceTree, diffTree *node, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTree, bool, bool) {
+	stree, seen := getMakeSequence(stree, haplotypeBlock, startIdx, endIdx)
+
+	i := hasSeq(stree.diffTrees, diffTree)
+
+	if i > -1 {
+		atomic.AddUint32(&stree.diffSeen[i], 1)
+
+		return stree, seen, true
+	}
+
+	// check again
+	stree.Lock()
+	i = hasSeq(stree.diffTrees, diffTree)
+
+	if i > -1 {
+		atomic.AddUint32(&stree.diffSeen[i], 1)
+
+		stree.Unlock()
+		return stree, seen, true
+	}
+
+	if stree.diffTrees == nil {
+		stree.diffTrees = []*node{diffTree}
+		stree.diffSeen = []uint32{1}
+
+		stree.Unlock()
+		return stree, seen, false
+	}
+
+	stree.diffTrees = append(stree.diffTrees, diffTree)
+	stree.diffSeen = append(stree.diffSeen, 1)
+
+	stree.Unlock()
+
+	return stree, seen, false
+}
+
+func hasSeq(diffTrees []*node, desired *node) int {
+	var i int
+	if len(diffTrees) > 0 {
+		for i = 0; i < len(diffTrees); i++ {
+			if diffTrees[i] == desired {
+				return i
+			}
+		}
+
+		return -1
+	}
+
+	return -1
+}
+
+// Instead of using shared map, use 2 arrays (slices)...100x faster
 func getMakeSequence(stree *sequenceTree, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTree, bool) {
-	// finalNode := stree
 	var diffs int
+	var n *sequenceTree
+
+	// Use slices instead of hash because hash has concurrency issues
+	// and number of bases is usually <= 4
 	for i := startIdx; i <= endIdx; i++ {
-		if stree.next != nil && stree.next[haplotypeBlock[i]] != nil {
-			stree = stree.next[haplotypeBlock[i]]
+		// log.Println(stree)
+		idx := bytes.IndexByte(stree.bases, haplotypeBlock[i])
+
+		if idx == -1 {
+			stree.Lock()
+
+			// Check again in case things have changed
+			// Cool enough, go src does this too (look at previous Map implementation)
+			idx = bytes.IndexByte(stree.bases, haplotypeBlock[i])
+
+			if idx == -1 {
+				diffs++
+				stree.bases = append(stree.bases, haplotypeBlock[i])
+
+				n = new(sequenceTree)
+				n.val = haplotypeBlock[i]
+				n.parent = stree
+
+				stree.next = append(stree.next, n)
+
+				stree.Unlock()
+				stree = n
+
+				continue
+			}
+
+			n = stree.next[idx]
+			stree.Unlock()
+
+			stree = n
+
 			continue
 		}
 
-		diffs++
-		stree = getMakeSeqNode(stree, haplotypeBlock[i])
+		stree = stree.next[idx]
 	}
 
-	atomic.AddUint32(&stree.seen, 1)
-
-	if diffs == endIdx-startIdx+1 {
+	if diffs == 0 {
+		atomic.AddUint32(&stree.seen, 1)
+		// log.Println("Shared:  for ", haplotypeBlock[startIdx:endIdx+1])
 		return stree, true
 	}
+
+	// log.Println("New: for ", haplotypeBlock[startIdx:endIdx+1])
 
 	return stree, false
 }
 
-func getMakeSeqNode(stree *sequenceTree, val byte) (next *sequenceTree) {
-	stree.RLock()
+// A map veresion; attractive, but slower.
+func getMakeSequenceMap(stree *sequenceTreeMap, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTreeMap, bool) {
+	var diffs int
 
-	if stree.next != nil && stree.next[val] != nil {
-		next = stree.next[val]
-		stree.RUnlock()
+	// var next *sequenceTree
+	// var ok bool
+	for i := startIdx; i <= endIdx; i++ {
+		// log.Println(stree)
+		next, ok := stree.next.Load(haplotypeBlock[i])
 
-		return next
+		if ok {
+			stree = next.(*sequenceTreeMap)
+			continue
+		}
+
+		diffs++
+		n := new(sequenceTreeMap)
+		n.val = haplotypeBlock[i]
+		n.parent = stree
+
+		stree.next.Store(haplotypeBlock[i], n)
+
+		stree = n
 	}
 
-	stree.RUnlock()
+	if diffs == 0 {
+		atomic.AddUint32(&stree.seen, 1)
+		// log.Println("Shared:  for ", haplotypeBlock[startIdx:endIdx+1])
+		return stree, true
+	}
 
-	next = new(sequenceTree)
-	next.val = val
+	// log.Println("New: for ", haplotypeBlock[startIdx:endIdx+1])
 
-	stree.Lock()
-	stree.next = make(map[byte]*sequenceTree)
-	stree.next[val] = next
-	next.parent = stree
-	stree.Unlock()
-
-	return next
+	return stree, false
 }
+
+// func getMakeSeqNode(stree *sequenceTree, val byte) (*{}interface, bool) {
+// 	next, ok := stree.next.Load(val)
+
+// 	if ok {
+// 		return next, true
+// 	}
+
+// 	stree.RUnlock()
+
+// 	next = new(sequenceTree)
+// 	next.val = val
+
+// 	stree.Lock()
+// 	stree.next = make(map[byte]*sequenceTree)
+// 	stree.next[val] = next
+// 	next.parent = stree
+// 	stree.Unlock()
+
+// 	return nil, next
+// }
 
 func getMakeNode(btree *node, val byte) *node {
 	// tree is read-only, except when we need to grow it
