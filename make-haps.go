@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -46,23 +45,8 @@ type sequenceTree struct {
 	// this node maps to some other alleles as well in the chain
 	// next   sync.Map //keys are bytes, values are *sequenceTree
 	sync.Mutex
-	bases     []byte
-	next      []*sequenceTree
-	diffTrees []*node
-	diffSeen  []uint32
-}
-
-type sequenceTreeMap struct {
-	// This is a read-only structure, except for next
-	// which is a shared Map
-	// each node gets the allele it represents
-	val byte
-	// how many times this particular sequence has recurred
-	seen uint32
-	// this node maps to some other alleles as well in the chain
-	// next   sync.Map //keys are bytes, values are *sequenceTree
-	next   sync.Map
-	parent *sequenceTreeMap
+	bases []byte
+	next  []*sequenceTree
 }
 
 type node struct {
@@ -71,15 +55,12 @@ type node struct {
 	right  *node
 	parent *node
 	val    byte
-	seq    *sequenceTree
+	// Each diff tree has one sequence tree, with N leaves, representing N
+	// alleles
+	seq *sequenceTree
 }
 
-// type allele struct {
-// 	start     uint32
-// 	finalNode *node
-// }
-
-type alleles struct {
+type sites struct {
 	chr string
 	// start uint32
 
@@ -137,11 +118,6 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	var mySlice = []byte{0, 1, 0, 1, 1, 0, 1, 1}
-	data := binary.BigEndian.Uint64(mySlice)
-	fmt.Println(data)
-	// os.Exit(1)
-
 	if config.maxThreads > runtime.GOMAXPROCS(0) {
 		runtime.GOMAXPROCS(config.maxThreads)
 	}
@@ -197,21 +173,34 @@ func run(config *config) {
 	// like the difference tree, but uses hashmap to track next branch
 	// heavier, but still cheaper than repeating
 	seqRoot := new(sequenceTree)
+
+	var outBase string
 	for idx, hPath := range hapsFiles {
-		wmFh, err := os.Create(strconv.Itoa(idx) + ".map")
+		dotIdx := strings.IndexByte(hPath, '.')
+
+		if dotIdx == -1 {
+			log.Printf("A file with no extension: %s; calling output by same name\n", hPath)
+			outBase = hPath
+		} else {
+			// since dotIdx is the index of the first '.', and we want 1 byte before
+			outBase = hPath[0:dotIdx]
+			log.Printf("Writing files with base: %s\n", outBase)
+		}
+
+		wmFh, err := os.Create(outBase + ".tped")
 
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		wpFh, err := os.Create(strconv.Itoa(idx) + ".ped")
+		wfFh, err := os.Create(outBase + ".fam")
 
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		wMap := bufio.NewWriter(wmFh)
-		wPed := bufio.NewWriter(wpFh)
+		wFam := bufio.NewWriter(wfFh)
 
 		sPath := sampleFiles[idx]
 
@@ -225,56 +214,24 @@ func run(config *config) {
 			log.Fatalf("No samples found for file %s", sPath)
 		}
 
-		wFunc, completer := createWriteFunc(wMap, wPed, idx, samples)
+		wFunc := createWriteFunc(wMap, wFam, idx, samples)
 
 		fmt.Println("Reading", hPath, sPath)
 		read(config, hPath, sPath, diffRoot, seqRoot, wFunc)
 
-		wMap.Flush()
-		wPed.Flush()
-
-		completer()
+		wFam.Flush()
+		wFam.Flush()
 	}
 }
 
-// Future idea: pre-make the tree
-// func warmTree(tree *node, nSamples int, firstNode bool) {
-// 	for i := 0; i < nSamples; i++ {
-// 		if tree.left == nil {
-// 			tree.left = newNode(tree, diffVal)
-// 		}
-
-// 		if tree.right == nil {
-// 			tree.right = newNode(tree, sameVal)
-// 		}
-// 	}
-// }
-
 // Generates a write function that must be called from a single thread
 // for a single file
-func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(words alleles), completer func()) {
+func createWriteFunc(mapWriter, famWriter *bufio.Writer, baseChr int, samples []string) (accumulator func(words sites)) {
 	log.Println("CALLED WITH THIS MANY SAMPLES", len(samples), baseChr)
 
-	// chr := baseChr
-
-	// var hIdx int
-	// var sPed []string
-	ped := make([]bytes.Buffer, len(samples), len(samples))
-	// Keep track of fake chrs, over sum{1 .. n}(numSubChr)
-
 	for _, famLine := range samples {
-		var f bytes.Buffer
-
-		f.WriteString(famLine)
-
-		ped = append(ped, f)
-	}
-
-	completer = func() {
-		for _, lBuffer := range ped {
-			lBuffer.WriteString("\n")
-			pWriter.WriteString(lBuffer.String())
-		}
+		famWriter.WriteString(famLine)
+		famWriter.WriteString("\n")
 	}
 
 	nAlleles := len(samples) * 2
@@ -290,14 +247,11 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 	}
 
 	// log.Println("word is length", word)
-	// var id int
-	// var idStr string
-	// var i int
+	var id int
+	var idStr string
 
-	// var wordNode *node
-	// var chr string
 	// Write the haplotype to the tped file
-	accumulator = func(alts alleles) {
+	accumulator = func(alts sites) {
 		// Build the allele slice backwards, since we operate
 		// from leaf of the binary tree
 		// Every other (from index 0) entry is an allele diff (1 has, 0 no)
@@ -305,52 +259,53 @@ func createWriteFunc(mWriter *bufio.Writer, pWriter *bufio.Writer, baseChr int, 
 		// We track the number of values in the alt allele
 		// to ensure that we overwrite every allele entry
 
-		// for idx, wordNode := range alts.wordLeaves {
-		// 	// id++
+		for idx, wordNode := range alts.wordLeaves {
+			id++
 
-		// 	// idStr = strconv.Itoa(id)
+			// this is the last node
+			diffLeaf := wordNode
+			idStr = strconv.Itoa(id)
 
-		// 	mWriter.WriteString(alts.chr)
-		// 	mWriter.WriteString("\t")
-		// 	// mWriter.Write(decodeSequence(alts.sequences[idx]))
-		// 	mWriter.WriteString("\t")
-		// 	// centimorgans... dummy
-		// 	mWriter.WriteString("0")
-		// 	mWriter.WriteString("\t")
-		// 	// position is basically a position; the positions aren't real
-		// 	// they're the order of the haplotypes we generate
-		// 	mWriter.WriteString(strconv.Itoa(int(alts.starts[idx])))
+			mapWriter.WriteString(alts.chr)
+			mapWriter.WriteString("\t")
+			//if using the compressed version mWriter.Write(decodeSequence(alts.sequences[idx]))
+			mapWriter.Write(walkSequenceTree(alts.sequences[idx]))
+			mapWriter.WriteString("\t")
+			// centimorgans... dummy
+			mapWriter.WriteString("0")
+			mapWriter.WriteString("\t")
+			// starting position; not writing ending position since no space for it
+			mapWriter.WriteString(strconv.Itoa(int(alts.starts[idx])))
 
-		// 	i = len(word) - 1
-		// 	seen := 0
-		// 	for {
-		// 		if wordNode.parent == nil {
-		// 			break
-		// 		}
+			i := len(word) - 1
+			seen := 0
+			for {
+				if wordNode.parent == nil {
+					break
+				}
 
-		// 		// log.Println(i)
-		// 		word[i] = wordNode.val
+				word[i] = diffLeaf.val
 
-		// 		wordNode = wordNode.parent
-		// 		i -= 2
-		// 		seen++
-		// 	}
+				wordNode = wordNode.parent
+				i -= 2
+				seen++
+			}
 
-		// 	// i should be -2 since decrement runs one extra time
-		// 	if i != -2 {
-		// 		log.Fatal("Word length must equal sample length: ", nAlleles, " got: ", i, "seen: ", seen)
-		// 	}
+			// i should be -2 since decrement runs one extra time
+			if i != -2 {
+				log.Fatal("Word length must equal sample length: ", nAlleles, " got: ", i, "seen: ", seen)
+			}
 
-		// 	mWriter.WriteString("\t")
-		// 	mWriter.Write(word)
-		// 	mWriter.WriteString("\n")
-		// }
+			mapWriter.WriteString("\t")
+			mapWriter.Write(word)
+			mapWriter.WriteString("\n")
+		}
 	}
 
-	return accumulator, completer
+	return accumulator
 }
 
-func read(config *config, hPath string, sPath string, btree *node, stree *sequenceTree, resultFunc func(alts alleles)) {
+func read(config *config, hPath string, sPath string, btree *node, stree *sequenceTree, resultFunc func(alts sites)) {
 	reader, err := getReader(hPath)
 
 	if err != nil {
@@ -365,7 +320,7 @@ func read(config *config, hPath string, sPath string, btree *node, stree *sequen
 	genotypeQueue := make(chan [][]string, 100)
 
 	// The haplotypes, with sample counts, for a given sub chr
-	results := make(chan alleles, 100)
+	results := make(chan sites, 100)
 
 	var wg sync.WaitGroup
 
@@ -458,7 +413,7 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 	// Read the lines into the work queue.
 	var lastStart int
 	var subChrCutoff int
-
+	var pos int
 	for {
 		row, err := reader.ReadString('\n') // 0x0A separator = newline
 
@@ -480,7 +435,8 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 		}
 
 		if pos >= subChrCutoff {
-			fmt.Println("About to make new", record[0], lastStart, pos, subChrCutoff, len(records))
+			log.Printf("About to make new: chr: %s, lastSentPos: %d, pos: %d, cutoff: %d, sites: %d\n",
+				record[0], lastStart, pos, subChrCutoff, len(records))
 
 			lastStart = pos
 			subChrCutoff = lastStart + blockSize
@@ -498,7 +454,8 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 	}
 
 	if len(records) > 0 {
-		fmt.Println("Sending remaining sites: ", lastStart, subChrCutoff, len(records))
+		log.Printf("Sending remaining sites: lastSentPos: %s, pos: %d, cutoff: %d, sites: %d\n",
+			lastStart, pos, subChrCutoff, len(records))
 		genotypeQueue <- records
 	}
 
@@ -509,7 +466,7 @@ func readFile(reader *bufio.Reader, genotypeQueue chan [][]string) {
 // by slices of each sample's column vector over some range within that block
 // then build a binary tree (shared across all threads) that diffs
 // against every other sample's vector slice, tracking diffs to avoid overwork
-func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequenceTree, results chan<- alleles, wg *sync.WaitGroup) {
+func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequenceTree, results chan<- sites, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// bufferSize := 1000
@@ -522,8 +479,9 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 		nSites := len(genotypes)
 
 		log.Println("Received this many sites: ", nSites)
-		// log.Println(genotypes[0])
-		// 5 non-sample fields
+
+		// 5 non-sample columns
+		rowLen := len(genotypes[0])
 		nSamples := len(genotypes[0]) - 5
 
 		// these are the 2N samples, i.e all chromosomes
@@ -537,241 +495,195 @@ func processGenotypes(genotypeQueue chan [][]string, root *node, stree *sequence
 
 		var chr string
 
-		// var wordLeaves []*node
-		var sequences []*sequenceTree
+		var wordLeaves []*node
 		var starts []uint32
-		// var read int
-		// var alts [][]byte
-		// var alt []byte
-		// var alts []uint64
-		// var starts []uint32
-		var seenDiffs int
-		var seenAlleles int
-		for rowIdx, row := range genotypes {
+		var sequences []*sequenceTree
+		var newAlleles int
+		var pos1 int
+		var pos2 int
+
+		// Haps format, has 2 alleles
+		// not nec ref and alt
+		alleles := make([]byte, 2)
+		// var ref byte
+		// var alt byte
+		for end, row := range genotypes {
 			chr = row[0]
 
 			pos, err := strconv.Atoi(row[2])
+
+			if end == 0 {
+				pos1 = pos
+			} else if end == nSites-1 {
+				pos2 = pos
+			}
 
 			if err != nil {
 				log.Fatal("couldn't read position")
 			}
 
-			// if pos < 147019380 || pos > 202133398 {
-			// 	continue
-			// }
+			alleles[0] = row[3][0]
 
-			// read++
+			// In generating alleles we assume first allele is ref
+			// and 2nd is alt.
+			// This is of course not strictly Haps-required
+			// In non-indel cases, it won't matter
+			// In indel cases, things may get weird
+			if len(row[4]) == len(row[3]) {
+				alleles[1] = row[4][0]
+			} else if len(row[4]) > len(row[3]) {
+				// Insertion if len "alt" is greater than len "ref"
+				// Looks to be padded, example: T TGGCTG
+				// So ref is still the first byte of row[3]
+				alleles[1] = '+'
+			} else {
+				// Deletion if len "alt" is < len "ref"
+				// Have not seen this to determine padding, may be too variable
+				// to handle consistently anyway
+				// So for now, ref is row[3][0]
+				alleles[1] = '-'
+			}
 
-			// log.Println("Reading", pos, read)
-			//Build the vector for each sample, since haplotypes consist of this vector
-			//over some start .. stop
-			// TODO: double check that len(row) has the expected nSamples - 5
-			if len(row)-5 != nSamples {
-				log.Fatal("Row is shorter than expected")
+			if len(row) != rowLen {
+				log.Fatalf("Row length different than expect: chr:%s, pos:%d", chr, pos)
 			}
 
 			for i := 5; i < len(row); i++ {
 				// Build up the sequence
 				// We do this for all sites, even after only 1 sample has every haplotype,
 				// because in the backwards pass unique combinations may still result
-				sampleGenos[i-5][rowIdx] = row[i][0]
+				sampleGenos[i-5][end] = row[i][0]
+
+				// We should have no null characters
+				if row[i][0] == 0 {
+					log.Println("Found NULL characters", row)
+					os.Exit(0)
+				}
 			}
 
 			// iterate overall of the samples, setting each sample's column as the "seqence"
 			// then for every other sample, calculate a diff; that diff is a binary tree "word"
 
 			// This is done in a backward pass, starting from rowIdx:
+			// Because allows us to build sampleGenos up inline
 			// ---------x (rowIdx)
 			// --------xx
 			// -------xxx
 			// ------xxxx
 			// We stop when we hit max entropy (all alleles are unique)
 
-			// Each loop of INNER gives a set of haplotypes of len(rowIdx - start + 1)
-			// var stuff []byte
+			// Each loop gives a set of haplotypes of length end - start + 1
 		WALK:
-			for start := rowIdx; start >= 0; start-- {
-				samplesToSkip := make([]bool, len(sampleGenos))
+			for start := end; start >= 0; start-- {
+				seenHaps := make([]bool, len(sampleGenos))
+				// var haps int
+				var skipCount int
 
-				var hapCount int
-				var uniqueCount int
-
-				// haplotypeBlock[start .. rowIdx] is a haplotype
+				// haplotypeBlock[start .. end] is a haplotype
 				for hIdx, haplotypeBlock := range sampleGenos {
-					if samplesToSkip[hIdx] == true {
+					if seenHaps[hIdx] == true {
+						skipCount++
 						continue
 					}
 
-					// seqLeaf, duplicateHap := getMakeSequenceMap(stree, haplotypeBlock, start, rowIdx)
-
-					// if duplicateHap == true {
-					// 	skipped++
-					// 	continue
-					// }
-
-					// log.Println(seqLeaf, duplicateHap)
-					hapCount++
-
-					// allow more than 32,768 samples
-					var diffs int
+					seenHaps[hIdx] = true
 
 					// Build from value-less root; golang pointers passed by value
 					// (are not references), so ok to modify
 					btree := root
-					// packed := []uint8
-
+				CHECK:
 					for j := 0; j < len(sampleGenos); j++ {
-						// if we're here, and the sample has had a haplotype
-						// identical to another, it is by definition impossible
-						// for it to have a haplotype that is identical to another
-						// samples
-						// Therefore, split left!
-						if samplesToSkip[j] == true {
-							diffs++
+						// if this is the currently examined haplotype,
+						// it's of course self-identical
+						if j == hIdx {
+							btree = getMakeNode(btree, sameVal)
 
+							continue CHECK
+						}
+
+						// If we've seen this haplotype before, and we've made it
+						// past the seenHaps[hIdx], we know this sample's hap
+						// must be different from the one being examined
+						// This is the corollary to the seenHaps check above
+						if seenHaps[j] == true {
+							// haps++
 							btree = getMakeNode(btree, diffVal)
 
-							continue
+							continue CHECK
 						}
 
 						// Check the haplotype[start : rowIdx + 1] against the sample
 						// If identical across entire length, split right
 						// else, split left
-						for i := start; i <= rowIdx; i++ {
-							if haplotypeBlock[i] == sampleGenos[j][i] {
-								continue
+					DIFF:
+						for i := start; i <= end; i++ {
+							if sampleGenos[j][i] == 0 {
+								log.Fatalf("Can't have null genotype, found at chr: %s, pos: %d, sampleIdx: %d, rowIdx: %d", chr, pos, j, i)
 							}
 
-							// Diff, since haplotype[i] != sampleGenoes[j][i]
-							diffs++
+							if haplotypeBlock[i] == sampleGenos[j][i] {
+								continue DIFF
+							}
+
+							// log.Printf("Diff: %d , %d @%d %v, %v", sampleGenos[j][i], haplotypeBlock[i], i, sampleGenos[j], haplotypeBlock)
 
 							btree = getMakeNode(btree, diffVal)
 
-							break
+							// since we found a difference, and have made a split
+							// continue to the next sample
+							continue CHECK
 						}
 
-						// same, since haplotype[i] == sampleGenos[j][i] for all i
-						samplesToSkip[j] = true
+						// Past DIFF loop, so haplotypes are identical
+						seenHaps[j] = true
 						btree = getMakeNode(btree, sameVal)
 					}
 
-					// If we're here, we've finished comparing all samples
-					// to 1 haplotype
-					// If that haplotype
+					if btree.seq == nil {
+						btree.Lock()
 
-					if diffs >= nSamples {
-						log.Fatal("wtf", chr, start, rowIdx)
-					}
-
-					// skip if all same?
-					// if diffs == 0 {
-					// 	continue
-					// }
-					log.Println("Unique", diffs)
-					// Every sample unique, except reference
-					if diffs == nSamples-1 {
-						log.Println("Unique")
-						uniqueCount++
-					}
-
-					// encoded := encodeSequence(haplotypeBlock, start, rowIdx)
-					// log.Println("\n\nEncoded: ", encoded)
-
-					// fmt.Printf("Value is %08b\n", seqPart)
-
-					// sequences = append(sequences, seqLeaf)
-
-					// seq := decodeSequence(encoded)
-
-					// log.Println("Trying to reproduce of len: ", len(haplotypeBlock[start:rowIdx+1]), " of seq : ", haplotypeBlock[start:rowIdx+1])
-					// log.Println("We reproduced of len: ", len(seq), " the sequence : ", seq)
-					// btree.Lock()
-					// if len(btree.seq) > 0 {
-					// 	log.Println("HAAASSS!", btree)
-					// }
-					// btree.seq = append(btree.seq, haplotypeBlock[start:rowIdx+1])
-					// btree.Unlock()
-
-					// if btree.seq == nil {
-					// 	btree.Lock()
-
-					// 	if btree.seq == nil {
-					// 		btree.seq = new(sequenceTree)
-					// 	}
-
-					// 	btree.Unlock()
-					// }
-
-					seq, seenBefore, diffSeen := getMakeSequenceAndAddNode(stree, btree, haplotypeBlock, start, rowIdx)
-
-					if diffSeen || seenBefore {
-						if diffSeen {
-							seenDiffs++
+						if btree.seq == nil {
+							btree.seq = new(sequenceTree)
 						}
 
-						if seenBefore {
-							seenAlleles++
-						}
+						btree.Unlock()
+					}
 
-						continue
+					seq, newAllele := getMakeSequence(btree.seq, haplotypeBlock, alleles, start, end)
+
+					if newAllele {
+						newAlleles++
 					}
 
 					sequences = append(sequences, seq)
 
-					// wordLeaves = append(wordLeaves, btree)
+					wordLeaves = append(wordLeaves, btree)
 					starts = append(starts, uint32(pos))
-					// zstd.Compress(stuff, haplotypeBlock[start:rowIdx+1])
-					// alts = append(alts, alt)
-					// alts = append(alts, allele{
-					// 	// seq:       getMakeSequence(btree, haplotypeBlock, start, rowIdx),
-					// 	start:     uint32(start),
-					// 	finalNode: btree,
-					// })
 				}
 
-				// results <- alleles{
-				// 	start:      uint32(start),
-				// 	wordLeaves: wordLeaves,
-				// 	// seqs:       alts,
-				// }
-				// if len(alts) > bufferSize {
-				// 	results <- alleles{
-				// 		chr:  chr,
-				// 		alts: alts,
-				// 	}
+				haps := nSamples - skipCount
+				// log.Printf("haps: %d, chr: %s, pos: %d, len: %d, startIdx: %d, endIdx %d", haps, chr, pos, end-start+1, start, end)
 
-				// 	alts = make([]allele, 0, bufferSize)
-				// }
-
-				if hapCount > 0 && hapCount == uniqueCount {
-					log.Println("Reached max entropy", hapCount, uniqueCount, chr, start, rowIdx)
+				if haps >= nSamples {
+					log.Println("Reached max entropy", haps, nSamples, chr, start, end)
 					break WALK
 				}
 			}
 		}
 
-		if len(sequences) > 0 {
-			results <- alleles{
-				chr: chr,
-				// wordLeaves: wordLeaves,
-				starts:    starts,
-				sequences: sequences,
-			}
+		if len(wordLeaves) == 0 {
+			log.Printf("Found no diff words! chr: %s, pos: %d - %d;  nSites: %d, ", chr, pos1, pos2, nSites)
 		} else {
-			log.Println("Nothing written: ", chr)
+			results <- sites{
+				chr:        chr,
+				wordLeaves: wordLeaves,
+				starts:     starts,
+				sequences:  sequences,
+			}
 		}
 
-		log.Printf("Alleles seen: %d, diffs seen %d", seenAlleles, seenDiffs)
-		// if len(alts) > 0 {
-		// 	results <- alleles{
-		// 		chr:  chr,
-		// 		alts: alts,
-		// 	}
-		// }
-
-		// For this to work, uncomment some stuff above
 		numUpdates := atomic.LoadUint64(&updates)
-		log.Println("Done with this many tree updates: ", numUpdates, " for this many sites", nSites)
+		log.Printf("\n\nDone with %d sites on chr %s pos:%d - %d. Found alleles: %d, diff tree updates: %d", nSites, chr, pos1, pos2, newAlleles, numUpdates)
 	}
 }
 
@@ -852,44 +764,6 @@ func decodeSequence(sequence []uint8) []byte {
 	return seq
 }
 
-func getMakeSequenceAndAddNode(stree *sequenceTree, diffTree *node, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTree, bool, bool) {
-	stree, seen := getMakeSequence(stree, haplotypeBlock, startIdx, endIdx)
-
-	i := hasSeq(stree.diffTrees, diffTree)
-
-	if i > -1 {
-		atomic.AddUint32(&stree.diffSeen[i], 1)
-
-		return stree, seen, true
-	}
-
-	// check again
-	stree.Lock()
-	i = hasSeq(stree.diffTrees, diffTree)
-
-	if i > -1 {
-		atomic.AddUint32(&stree.diffSeen[i], 1)
-
-		stree.Unlock()
-		return stree, seen, true
-	}
-
-	if stree.diffTrees == nil {
-		stree.diffTrees = []*node{diffTree}
-		stree.diffSeen = []uint32{1}
-
-		stree.Unlock()
-		return stree, seen, false
-	}
-
-	stree.diffTrees = append(stree.diffTrees, diffTree)
-	stree.diffSeen = append(stree.diffSeen, 1)
-
-	stree.Unlock()
-
-	return stree, seen, false
-}
-
 func hasSeq(diffTrees []*node, desired *node) int {
 	var i int
 	if len(diffTrees) > 0 {
@@ -906,7 +780,7 @@ func hasSeq(diffTrees []*node, desired *node) int {
 }
 
 // Instead of using shared map, use 2 arrays (slices)...100x faster
-func getMakeSequence(stree *sequenceTree, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTree, bool) {
+func getMakeSequence(stree *sequenceTree, haplotypeBlock, alleles []byte, startIdx, endIdx int) (*sequenceTree, bool) {
 	var diffs int
 	var n *sequenceTree
 
@@ -928,7 +802,14 @@ func getMakeSequence(stree *sequenceTree, haplotypeBlock []byte, startIdx, endId
 				stree.bases = append(stree.bases, haplotypeBlock[i])
 
 				n = new(sequenceTree)
-				n.val = haplotypeBlock[i]
+				if haplotypeBlock[i] == '1' {
+					n.val = alleles[1]
+				} else if haplotypeBlock[i] == '0' {
+					n.val = alleles[0]
+				} else {
+					log.Fatal("Haplotype must be ASCII 49 (1) or 48 (0), found: ", haplotypeBlock[i])
+				}
+
 				n.parent = stree
 
 				stree.next = append(stree.next, n)
@@ -961,62 +842,24 @@ func getMakeSequence(stree *sequenceTree, haplotypeBlock []byte, startIdx, endId
 	return stree, false
 }
 
-// A map veresion; attractive, but slower.
-func getMakeSequenceMap(stree *sequenceTreeMap, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTreeMap, bool) {
-	var diffs int
+// No locks needed; sequence tree is write-once per node
+// and arrays can be read concurrently
+func walkSequenceTree(seq *sequenceTree) []byte {
+	var s []byte
 
-	// var next *sequenceTree
-	// var ok bool
-	for i := startIdx; i <= endIdx; i++ {
-		// log.Println(stree)
-		next, ok := stree.next.Load(haplotypeBlock[i])
-
-		if ok {
-			stree = next.(*sequenceTreeMap)
-			continue
+	node := seq
+	for {
+		if node.parent == nil {
+			break
 		}
 
-		diffs++
-		n := new(sequenceTreeMap)
-		n.val = haplotypeBlock[i]
-		n.parent = stree
+		node = node.parent
 
-		stree.next.Store(haplotypeBlock[i], n)
-
-		stree = n
+		s = append(s, node.val)
 	}
 
-	if diffs == 0 {
-		atomic.AddUint32(&stree.seen, 1)
-		// log.Println("Shared:  for ", haplotypeBlock[startIdx:endIdx+1])
-		return stree, true
-	}
-
-	// log.Println("New: for ", haplotypeBlock[startIdx:endIdx+1])
-
-	return stree, false
+	return s
 }
-
-// func getMakeSeqNode(stree *sequenceTree, val byte) (*{}interface, bool) {
-// 	next, ok := stree.next.Load(val)
-
-// 	if ok {
-// 		return next, true
-// 	}
-
-// 	stree.RUnlock()
-
-// 	next = new(sequenceTree)
-// 	next.val = val
-
-// 	stree.Lock()
-// 	stree.next = make(map[byte]*sequenceTree)
-// 	stree.next[val] = next
-// 	next.parent = stree
-// 	stree.Unlock()
-
-// 	return nil, next
-// }
 
 func getMakeNode(btree *node, val byte) *node {
 	// tree is read-only, except when we need to grow it
@@ -1117,4 +960,101 @@ func getNodeNoLock(btree *node, val byte) *node {
 // 	}
 
 // 	return n
+// }
+
+// func getMakeSeqNode(stree *sequenceTree, val byte) (*{}interface, bool) {
+// 	next, ok := stree.next.Load(val)
+
+// 	if ok {
+// 		return next, true
+// 	}
+
+// 	stree.RUnlock()
+
+// 	next = new(sequenceTree)
+// 	next.val = val
+
+// 	stree.Lock()
+// 	stree.next = make(map[byte]*sequenceTree)
+// 	stree.next[val] = next
+// 	next.parent = stree
+// 	stree.Unlock()
+
+// 	return nil, next
+// }
+
+// an inverted version; stores a *node in a global sequenceTree
+// where *node is the leaf of a given diff tree/word
+// func getMakeSequenceAndAddNode(stree *sequenceTree, diffTree *node, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTree, bool, bool) {
+// 	stree, seen := getMakeSequence(stree, haplotypeBlock, startIdx, endIdx)
+
+// 	i := hasSeq(stree.diffTrees, diffTree)
+
+// 	if i > -1 {
+// 		atomic.AddUint32(&stree.diffSeen[i], 1)
+
+// 		return stree, seen, true
+// 	}
+
+// 	// check again
+// 	stree.Lock()
+// 	i = hasSeq(stree.diffTrees, diffTree)
+
+// 	if i > -1 {
+// 		atomic.AddUint32(&stree.diffSeen[i], 1)
+
+// 		stree.Unlock()
+// 		return stree, seen, true
+// 	}
+
+// 	if stree.diffTrees == nil {
+// 		stree.diffTrees = []*node{diffTree}
+// 		stree.diffSeen = []uint32{1}
+
+// 		stree.Unlock()
+// 		return stree, seen, false
+// 	}
+
+// 	stree.diffTrees = append(stree.diffTrees, diffTree)
+// 	stree.diffSeen = append(stree.diffSeen, 1)
+
+// 	stree.Unlock()
+
+// 	return stree, seen, false
+// }
+
+// A map veresion; attractive, but slower.
+// func getMakeSequenceMap(stree *sequenceTreeMap, haplotypeBlock []byte, startIdx, endIdx int) (*sequenceTreeMap, bool) {
+// 	var diffs int
+
+// 	// var next *sequenceTree
+// 	// var ok bool
+// 	for i := startIdx; i <= endIdx; i++ {
+// 		// log.Println(stree)
+// 		next, ok := stree.next.Load(haplotypeBlock[i])
+
+// 		if ok {
+// 			stree = next.(*sequenceTreeMap)
+// 			continue
+// 		}
+
+// 		diffs++
+// 		n := new(sequenceTreeMap)
+// 		n.val = haplotypeBlock[i]
+// 		n.parent = stree
+
+// 		stree.next.Store(haplotypeBlock[i], n)
+
+// 		stree = n
+// 	}
+
+// 	if diffs == 0 {
+// 		atomic.AddUint32(&stree.seen, 1)
+// 		// log.Println("Shared:  for ", haplotypeBlock[startIdx:endIdx+1])
+// 		return stree, true
+// 	}
+
+// 	// log.Println("New: for ", haplotypeBlock[startIdx:endIdx+1])
+
+// 	return stree, false
 // }
